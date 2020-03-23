@@ -94,6 +94,11 @@ type DaprRuntime struct {
 	allowedTopics            []string
 }
 
+type pubSubTopic struct {
+	Name                  string
+	MaxConcurrentMessages int
+}
+
 // NewDaprRuntime returns a new runtime with the given runtime config and global config
 func NewDaprRuntime(runtimeConfig *Config, globalConfig *config.Configuration) *DaprRuntime {
 	return &DaprRuntime{
@@ -661,10 +666,11 @@ func (a *DaprRuntime) initState(registry state_loader.Registry) error {
 	return nil
 }
 
-func (a *DaprRuntime) getSubscribedTopicsFromApp() []string {
-	topics := []string{}
+func (a *DaprRuntime) getSubscribedTopicsFromApp() []pubSubTopic {
+	topicsObjects := []pubSubTopic{}
+
 	if a.appChannel == nil {
-		return topics
+		return topicsObjects
 	}
 
 	if a.runtimeConfig.ApplicationProtocol == HTTPProtocol {
@@ -675,21 +681,47 @@ func (a *DaprRuntime) getSubscribedTopicsFromApp() []string {
 
 		resp, err := a.appChannel.InvokeMethod(req)
 		if err == nil && http.GetStatusCodeFromMetadata(resp.Metadata) == 200 {
+			topics := []string{}
+			// check if a simple topic string array is returned from app
 			err := json.Unmarshal(resp.Data, &topics)
 			if err != nil {
-				log.Errorf("error getting topics from app: %s", err)
+				// topic object is returned
+				err := json.Unmarshal(resp.Data, &topicsObjects)
+				if err != nil {
+					log.Errorf("error getting topics from app: %s", err)
+				}
+			} else {
+				topicsObjects = make([]pubSubTopic, len(topics))
+				for _, t := range topics {
+					topicsObjects = append(topicsObjects, pubSubTopic{
+						Name:                  t,
+						MaxConcurrentMessages: 0,
+					})
+				}
 			}
 		}
 	} else if a.runtimeConfig.ApplicationProtocol == GRPCProtocol {
 		client := daprclient_pb.NewDaprClientClient(a.grpc.AppClient)
 		resp, err := client.GetTopicSubscriptions(context.Background(), &empty.Empty{})
 		if err == nil && resp != nil {
-			topics = resp.Topics
+			topics := resp.Topics
+			topicsObjects = make([]pubSubTopic, len(topics))
+			for _, t := range topics {
+				topicsObjects = append(topicsObjects, pubSubTopic{
+					Name:                  t,
+					MaxConcurrentMessages: 0,
+				})
+			}
 		}
 	}
 
+	topics := make([]string, len(topicsObjects))
+	for _, t := range topicsObjects {
+		topics = append(topics, t.Name)
+	}
+
 	log.Infof("App is subscribed to the following topics: %v", topics)
-	return topics
+	return topicsObjects
 }
 
 func (a *DaprRuntime) initExporters() error {
@@ -763,14 +795,15 @@ func (a *DaprRuntime) initPubSub() error {
 	if a.pubSub != nil && a.appChannel != nil {
 		topics := a.getSubscribedTopicsFromApp()
 		for _, t := range topics {
-			allowed := a.isPubSubOperationAllowed(t, scopedSubscriptions)
+			allowed := a.isPubSubOperationAllowed(t.Name, scopedSubscriptions)
 			if !allowed {
 				log.Warnf("subscription to topic %s is not allowed", t)
 				continue
 			}
 
 			err := a.pubSub.Subscribe(pubsub.SubscribeRequest{
-				Topic: t,
+				Topic:                 t.Name,
+				MaxConcurrentMessages: t.MaxConcurrentMessages,
 			}, publishFunc)
 			if err != nil {
 				log.Warnf("failed to subscribe to topic %s: %s", t, err)
